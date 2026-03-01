@@ -38,3 +38,7 @@ python3 -m venv tankai --system-site-packages
 source tankai/bin/activate
 pip install ultralytics opencv-python gpiozero lgpio
 python3 tank_ai.py
+=======
+# tankai
+A robot tank for Pepe (my dog)
+>>>>>>> 60fb0c9ab44494b92812ef5c9d6d4a9b1aa73d64
