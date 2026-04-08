@@ -7,7 +7,7 @@ import uuid
 import math
 import random
 import shutil
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -402,6 +402,138 @@ async def vendor_page(vendor_code: str):
         "</head>",
         f'<script>window.VENDOR_CODE="{vendor_code.upper()}";</script></head>'
     )
+
+
+# ── WhatsApp webhooks ─────────────────────────────────────────
+
+from whatsapp import (
+    parse_message, send_message,
+    HELP_MSG, VENDOR_INFO_MSG, UNKNOWN_MSG,
+    META_VERIFY_TOKEN, PROVIDER,
+    build_price_reply, build_negotiate_reply, build_vendor_lookup_reply,
+)
+from negotiator import get_bot_advice
+import asyncio
+
+
+async def _handle_whatsapp(sender: str, text: str):
+    """Process an incoming WhatsApp message and send a reply."""
+    parsed = parse_message(text)
+    intent = parsed["intent"]
+
+    if intent == "help":
+        await send_message(sender, HELP_MSG)
+        return
+
+    if intent == "vendor_info":
+        await send_message(sender, VENDOR_INFO_MSG)
+        return
+
+    if intent == "vendor_lookup":
+        story = get_vendor_story(parsed["code"])
+        await send_message(sender, build_vendor_lookup_reply(story))
+        return
+
+    if intent == "prices":
+        item, city = parsed["item"], parsed["city"]
+        country = parsed.get("country")
+
+        data = get_prices(item, city)
+        prices_usd = [r["price_usd"] for r in data if r.get("price_usd")]
+        stats = None
+        if prices_usd:
+            s = sorted(prices_usd)
+            stats = {
+                "low": min(s), "high": max(s),
+                "median": s[len(s) // 2], "count": len(s),
+            }
+
+        fair = get_fair_price(item, country) if country else None
+
+        ai_text = get_bot_advice(
+            intent="prices", item=item, city=city,
+            community_low=stats["low"] if stats else None,
+            community_high=stats["high"] if stats else None,
+            community_median=stats["median"] if stats else None,
+            community_count=stats["count"] if stats else 0,
+            fair_context=fair["context"] if fair else "",
+        )
+
+        reply = build_price_reply(item, city, stats, fair, ai_text)
+        await send_message(sender, reply)
+        return
+
+    if intent == "negotiate":
+        item = parsed["item"]
+        city = parsed["city"]
+        price = parsed["price"]
+        currency = parsed["currency"]
+        country = parsed.get("country")
+
+        data = get_prices(item, city)
+        prices_usd = [r["price_usd"] for r in data if r.get("price_usd")]
+        low = min(prices_usd) if prices_usd else None
+        high = max(prices_usd) if prices_usd else None
+
+        fair = get_fair_price(item, country) if country else None
+
+        ai_text = get_bot_advice(
+            intent="negotiate", item=item, city=city,
+            asking_price=price, currency=currency,
+            community_low=low, community_high=high,
+            fair_usd=fair["fair_price_usd"] if fair else None,
+        )
+
+        reply = build_negotiate_reply(item, city, price, currency, ai_text)
+        await send_message(sender, reply)
+        return
+
+    await send_message(sender, UNKNOWN_MSG)
+
+
+# Twilio webhook (form-encoded)
+@app.post("/webhook/whatsapp/twilio")
+async def whatsapp_twilio(
+    request: Request,
+    Body: str = Form(default=""),
+    From: str = Form(default=""),
+):
+    asyncio.create_task(_handle_whatsapp(From, Body))
+    # Twilio expects TwiML response; empty = no immediate reply (we reply async)
+    return Response(
+        content='<?xml version="1.0"?><Response></Response>',
+        media_type="text/xml",
+    )
+
+
+# Meta Cloud API webhook — verification
+@app.get("/webhook/whatsapp/meta")
+async def whatsapp_meta_verify(
+    hub_mode: str = Query(alias="hub.mode", default=""),
+    hub_challenge: str = Query(alias="hub.challenge", default=""),
+    hub_verify_token: str = Query(alias="hub.verify_token", default=""),
+):
+    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
+        return Response(content=hub_challenge, media_type="text/plain")
+    raise HTTPException(403, "Verification failed")
+
+
+# Meta Cloud API webhook — messages
+@app.post("/webhook/whatsapp/meta")
+async def whatsapp_meta_receive(request: Request):
+    payload = await request.json()
+    try:
+        for entry in payload.get("entry", []):
+            for change in entry.get("changes", []):
+                messages = change.get("value", {}).get("messages", [])
+                for msg in messages:
+                    if msg.get("type") == "text":
+                        sender = msg["from"]
+                        text = msg["text"]["body"]
+                        asyncio.create_task(_handle_whatsapp(sender, text))
+    except Exception as e:
+        print(f"[Meta webhook] Error: {e}")
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""AI negotiation advisor powered by Claude Opus 4.6."""
+"""AI negotiation advisor powered by Claude Opus 4.6 (web) and Haiku 4.5 (bot)."""
 
 import os
 import json
@@ -110,3 +110,88 @@ def stream_negotiation_advice(
         yield f"data: {json.dumps({'error': 'API key not configured. Add ANTHROPIC_API_KEY to your .env file.'})}\n\n"
     except Exception as e:
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+
+BOT_SYSTEM = """You are HaggleAI, a WhatsApp bot helping travellers negotiate at markets.
+Keep replies SHORT — under 300 words, plain text, minimal formatting.
+Use emojis sparingly. Be direct, practical, culturally aware.
+Always mention the fair price floor that protects the vendor's livelihood."""
+
+BOT_PRICE_PROMPT = """Traveller asking about: {item} in {city}
+
+Community prices (USD): low ${low}, typical ${median}, high ${high} ({count} reports)
+Fair price context: {fair_context}
+
+Write a SHORT WhatsApp reply (under 250 words) with:
+1. Price range summary
+2. The fair floor price (protecting vendor wages)
+3. A one-line negotiation opener they can use right now
+4. One culture-specific tip for {city}
+
+End with: "Reply 'negotiate [price] [currency] {item} {city}' for a full script"
+"""
+
+BOT_NEGOTIATE_PROMPT = """Traveller at market in {city} buying {item}.
+Vendor asking: {price} {currency}
+Vendor said: "{opening}"
+Community pays: ${low}–${high} USD
+Fair price floor (vendor wages): ${fair_usd} USD
+
+Write a SHORT WhatsApp negotiation guide (under 250 words):
+1. Exact counter-offer to say NOW (one sentence)
+2. Target price in {currency}
+3. Walk-away price in {currency}
+4. Two quick tips for {city} markets
+
+Keep it punchy. They're standing at the stall.
+"""
+
+
+def get_bot_advice(
+    intent: str,
+    item: str,
+    city: str,
+    asking_price: float = None,
+    currency: str = "USD",
+    vendor_opening: str = "",
+    community_low: float = None,
+    community_high: float = None,
+    community_median: float = None,
+    community_count: int = 0,
+    fair_context: str = "",
+    fair_usd: float = None,
+) -> str:
+    """Fast, concise negotiation advice for WhatsApp. Uses Haiku 4.5."""
+    client = _get_client()
+
+    if intent == "prices":
+        prompt = BOT_PRICE_PROMPT.format(
+            item=item, city=city,
+            low=community_low or "?",
+            median=community_median or "?",
+            high=community_high or "?",
+            count=community_count,
+            fair_context=fair_context or "No local wage data available.",
+        )
+    else:
+        prompt = BOT_NEGOTIATE_PROMPT.format(
+            item=item, city=city,
+            price=asking_price, currency=currency,
+            opening=vendor_opening or "unspecified",
+            low=community_low or "unknown",
+            high=community_high or "unknown",
+            fair_usd=fair_usd or "unknown",
+        )
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            system=BOT_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return next(b.text for b in response.content if b.type == "text")
+    except anthropic.AuthenticationError:
+        return "⚠️ Bot AI not configured. Visit haggle.app for full advice."
+    except Exception as e:
+        return f"⚠️ Sorry, couldn't generate advice right now. Try haggle.app"
