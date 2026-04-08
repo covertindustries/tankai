@@ -2,7 +2,9 @@
 
 import sqlite3
 import os
+import json
 from datetime import datetime
+from typing import Optional
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "haggle.db")
 
@@ -16,6 +18,23 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS vendor_stories (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_code     TEXT NOT NULL UNIQUE,
+                city            TEXT NOT NULL,
+                city_slug       TEXT NOT NULL,
+                country         TEXT,
+                craft           TEXT NOT NULL,
+                craft_slug      TEXT NOT NULL,
+                story           TEXT,
+                time_to_make    TEXT,
+                materials       TEXT,
+                generation      TEXT,
+                photo_paths     TEXT DEFAULT '[]',
+                views           INTEGER DEFAULT 0,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS price_reports (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 item        TEXT NOT NULL,
@@ -100,6 +119,80 @@ COMMON_ITEMS = {
 
 def get_item_suggestions() -> dict:
     return COMMON_ITEMS
+
+
+# ── Vendor stories ────────────────────────────────────────────────────────────
+
+def create_vendor_story(
+    vendor_code: str, city: str, country: str, craft: str,
+    story: str, time_to_make: str, materials: str, generation: str,
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO vendor_stories
+              (vendor_code, city, city_slug, country, craft, craft_slug,
+               story, time_to_make, materials, generation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            vendor_code, city.strip(), slugify(city),
+            country.strip() if country else None,
+            craft.strip(), slugify(craft),
+            story.strip() if story else None,
+            time_to_make.strip() if time_to_make else None,
+            materials.strip() if materials else None,
+            generation.strip() if generation else None,
+        ))
+        return cur.lastrowid
+
+
+def get_vendor_story(vendor_code: str) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM vendor_stories WHERE vendor_code = ?",
+            (vendor_code,)
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE vendor_stories SET views = views + 1 WHERE vendor_code = ?",
+            (vendor_code,)
+        )
+        return dict(row)
+
+
+def add_vendor_photo(vendor_code: str, photo_path: str):
+    import json
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT photo_paths FROM vendor_stories WHERE vendor_code = ?",
+            (vendor_code,)
+        ).fetchone()
+        if not row:
+            return
+        paths = json.loads(row["photo_paths"] or "[]")
+        paths.append(photo_path)
+        conn.execute(
+            "UPDATE vendor_stories SET photo_paths = ? WHERE vendor_code = ?",
+            (json.dumps(paths), vendor_code)
+        )
+
+
+def get_vendor_stories_for_city(city: str, craft: str = None) -> list[dict]:
+    city_slug = slugify(city)
+    with get_conn() as conn:
+        if craft:
+            rows = conn.execute("""
+                SELECT * FROM vendor_stories
+                WHERE city_slug = ? AND craft_slug LIKE ?
+                ORDER BY views DESC LIMIT 5
+            """, (city_slug, f"%{slugify(craft)}%")).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM vendor_stories
+                WHERE city_slug = ?
+                ORDER BY views DESC LIMIT 5
+            """, (city_slug,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def submit_price(

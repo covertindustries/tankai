@@ -19,11 +19,14 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from database import (
     init_db, get_prices, submit_price, get_ads,
     seed_sample_data, get_item_suggestions,
+    create_vendor_story, get_vendor_story,
+    add_vendor_photo, get_vendor_stories_for_city,
 )
 from scraper import scrape_reddit_prices
 from negotiator import stream_negotiation_advice
 from currency import get_rates, convert_to_usd, SUPPORTED_CURRENCIES
 from reference_prices import get_reference_price
+from wages import get_fair_price, get_wage_for_country
 
 app = FastAPI(title="Haggle", description="The Negotiator's App")
 
@@ -100,8 +103,33 @@ async def startup():
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
+    with open(os.path.join(STATIC_DIR, "landing.html")) as f:
+        return f.read()
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def app_ui():
     with open(os.path.join(STATIC_DIR, "index.html")) as f:
         return f.read()
+
+
+# ── Waitlist ──────────────────────────────────────────────────
+
+class WaitlistEntry(BaseModel):
+    email: str = Field(..., min_length=5, max_length=200)
+
+
+@app.post("/api/waitlist", status_code=201)
+async def api_waitlist(body: WaitlistEntry):
+    import re
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", body.email):
+        raise HTTPException(400, "Invalid email")
+
+    waitlist_path = os.path.join(BASE_DIR, "waitlist.csv")
+    from datetime import datetime
+    with open(waitlist_path, "a") as f:
+        f.write(f"{body.email},{datetime.utcnow().isoformat()}\n")
+    return {"message": "You're on the list!"}
 
 
 # ── Item suggestions ──────────────────────────────────────────
@@ -163,6 +191,15 @@ async def api_get_prices(
     # City center for map default view
     city_center = CITY_COORDS.get(city.lower().strip())
 
+    # Fair price context
+    fair = None
+    country_guess = community[0]["country"] if community else None
+    if country_guess:
+        fair = get_fair_price(item, country_guess)
+
+    # Vendor stories for this city/item
+    vendor_stories = get_vendor_stories_for_city(city, item)
+
     return {
         "item": item,
         "city": city,
@@ -171,6 +208,8 @@ async def api_get_prices(
         "stats": stats,
         "markers": markers,
         "city_center": list(city_center) if city_center else None,
+        "fair_price": fair,
+        "vendor_stories": vendor_stories,
     }
 
 
@@ -274,6 +313,95 @@ async def api_currencies():
 @app.get("/api/ads")
 async def api_ads(city: str = Query(default="global")):
     return {"ads": get_ads(city)}
+
+
+# ── Fair price ────────────────────────────────────────────────
+
+@app.get("/api/fair-price")
+async def api_fair_price(
+    item: str = Query(..., min_length=1),
+    country: str = Query(..., min_length=1),
+):
+    result = get_fair_price(item, country)
+    return result
+
+
+# ── Vendor stories ─────────────────────────────────────────────
+
+class VendorStoryCreate(BaseModel):
+    city: str = Field(..., min_length=1)
+    country: str = Field(..., min_length=1)
+    craft: str = Field(..., min_length=1, description="What you make")
+    story: Optional[str] = Field(None, max_length=800)
+    time_to_make: Optional[str] = Field(None, max_length=100,
+        description="e.g. '2 days per carpet'")
+    materials: Optional[str] = Field(None, max_length=200,
+        description="e.g. 'hand-spun wool, natural dyes'")
+    generation: Optional[str] = Field(None, max_length=100,
+        description="e.g. '3rd generation weaver'")
+
+
+@app.post("/api/vendors", status_code=201)
+async def api_create_vendor(body: VendorStoryCreate):
+    vendor_code = uuid.uuid4().hex[:10].upper()
+    create_vendor_story(
+        vendor_code=vendor_code,
+        city=body.city,
+        country=body.country,
+        craft=body.craft,
+        story=body.story or "",
+        time_to_make=body.time_to_make or "",
+        materials=body.materials or "",
+        generation=body.generation or "",
+    )
+    return {
+        "vendor_code": vendor_code,
+        "share_url": f"/vendor/{vendor_code}",
+        "message": "Your story has been created. Share your code with travellers!",
+    }
+
+
+@app.get("/api/vendors/{vendor_code}")
+async def api_get_vendor(vendor_code: str):
+    story = get_vendor_story(vendor_code.upper())
+    if not story:
+        raise HTTPException(404, "Vendor story not found")
+    return story
+
+
+@app.post("/api/vendors/{vendor_code}/photos", status_code=201)
+async def api_upload_vendor_photo(
+    vendor_code: str,
+    photo: UploadFile = File(...),
+):
+    story = get_vendor_story(vendor_code.upper())
+    if not story:
+        raise HTTPException(404, "Vendor story not found")
+
+    ext = os.path.splitext(photo.filename)[-1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+        raise HTTPException(400, "Invalid image format")
+
+    fname = f"vendor_{vendor_code}_{uuid.uuid4().hex[:8]}{ext}"
+    save_path = os.path.join(UPLOADS_DIR, fname)
+    with open(save_path, "wb") as f:
+        shutil.copyfileobj(photo.file, f)
+
+    photo_path = f"/uploads/{fname}"
+    add_vendor_photo(vendor_code.upper(), photo_path)
+    return {"photo_path": photo_path}
+
+
+@app.get("/vendor/{vendor_code}", response_class=HTMLResponse)
+async def vendor_page(vendor_code: str):
+    """Public vendor story page — shareable URL."""
+    with open(os.path.join(STATIC_DIR, "index.html")) as f:
+        html = f.read()
+    # Inject vendor code for the SPA to pick up
+    return html.replace(
+        "</head>",
+        f'<script>window.VENDOR_CODE="{vendor_code.upper()}";</script></head>'
+    )
 
 
 if __name__ == "__main__":
