@@ -4,5 +4,3 @@ __pycache__/
 tankai/
 .env
 recordings/
-
-haggle/haggle.db
